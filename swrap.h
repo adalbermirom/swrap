@@ -44,11 +44,16 @@ swrap notes:
 #define SWRAP_NODELAY 0x02
 
 //structs
+/* Beto Sep, 6 2026 */
 struct swrap_addr {
-    char data[128]; //enough space to hold any kind of address
+    //char data[128]; //enough space to hold any kind of address
+    double data[16]; //16 doubles = 128 bytes, for alignment!
 };
 
 //function declarations
+
+SWDEF void swrapGetLastSocketError(char* buf, size_t buf_size);
+    //Returns the last error in a formated string.
 SWDEF int swrapInit();
     //initializes socket functionality, returns 0 on success
 SWDEF int swrapSocket(int, int, char, const char*, const char*);
@@ -123,6 +128,23 @@ SWDEF int swrapMultiSelect(int*, int, double);
     #endif
 #endif
 #include <stddef.h> //NULL
+#include <errno.h>
+
+
+
+void swrapGetLastSocketError(char* buf, size_t buf_size) {
+#ifdef _WIN32
+    int err = WSAGetLastError();
+    FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, err,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        buf, (DWORD)buf_size, NULL);
+#else
+    strerror_r(errno, buf, buf_size);
+#endif
+}
+
 
 //general functions
 SWDEF int swrapInit () {
@@ -133,78 +155,100 @@ SWDEF int swrapInit () {
         return 0;
     #endif
 }
-SWDEF int swrapSocket (int prot, int mode, char flags, const char* host, const char* serv) {
-    //set up addrinfo hint
-    struct addrinfo* result, hint = {
-        (mode == SWRAP_BIND) ? AI_PASSIVE : 0, //ai_flags
-        AF_UNSPEC, //ai_family
-        (prot == SWRAP_TCP) ? SOCK_STREAM : SOCK_DGRAM, //ai_socktype
-        0, 0, NULL, NULL, NULL};
-    //get address info
-    if (getaddrinfo(host, serv, &hint, &result)) return -1;
-    //create socket
-    #ifdef _WIN32
-        SOCKET wsck = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-        if (wsck == INVALID_SOCKET) return -1;
-        //reject socket handle outside int range
-        if (wsck > INT_MAX) {
-            closesocket(wsck);
-            return -1;
+
+/* Beto Sep, 6 2026 */
+SWDEF int swrapSocket(int prot, int mode, char flags, const char* host, const char* serv) {
+    struct addrinfo* result = NULL;
+    struct addrinfo* p = NULL;
+    int sock = -1;
+
+    struct addrinfo hint = {
+        (mode == SWRAP_BIND) ? AI_PASSIVE : 0,
+        AF_UNSPEC,
+        (prot == SWRAP_TCP) ? SOCK_STREAM : SOCK_DGRAM,
+        0, 0, NULL, NULL, NULL
+    };
+
+    if (getaddrinfo(host, serv, &hint, &result) != 0) {
+        return -1;
+    }
+
+    // Iterar pela lista encadeada até encontrar um endereço que funcione
+    for (p = result; p != NULL; p = p->ai_next) {
+#ifdef _WIN32
+        SOCKET wsck = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (wsck == INVALID_SOCKET || wsck > INT_MAX) {
+            if (wsck != INVALID_SOCKET) closesocket(wsck);
+            continue; // Tenta o próximo nó
         }
-        //convert to int
-        int sock = wsck;
-    #else
-        int sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-        if (sock == -1) return -1;
-    #endif
-    //make sure IPV6_ONLY is disabled
-    if (result->ai_family == AF_INET6) {
-        int no = 0;
-        #ifdef _WIN32
+        sock = (int)wsck;
+#else
+        sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sock == -1) continue; // Tenta o próximo nó
+#endif
+
+        // Configuração de IPV6_V6ONLY (para permitir dual-stack IPv4/IPv6)
+        if (p->ai_family == AF_INET6) {
+            int no = 0;
+#ifdef _WIN32
             setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&no, sizeof(no));
-        #else
+#else
             setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (void*)&no, sizeof(no));
-        #endif
-    }
-    //set TCP_NODELAY if applicable
-    if (prot == SWRAP_TCP) {
-        int nodelay = (flags&SWRAP_NODELAY);
-        #ifdef _WIN32
+#endif
+        }
+
+        // Configuração de TCP_NODELAY
+        if (prot == SWRAP_TCP) {
+            int nodelay = (flags & SWRAP_NODELAY) ? 1 : 0;
+#ifdef _WIN32
             setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
-        #else
+#else
             setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void*)&nodelay, sizeof(nodelay));
-        #endif
-    }
-    //bind if applicable
-    if ((mode == SWRAP_BIND)&&(bind(sock, result->ai_addr, result->ai_addrlen))) {
-        swrapClose(sock);
-        return -1;
-    }
-    //set non-blocking if needed
-    if (flags&SWRAP_NOBLOCK) {
-        #ifdef _WIN32
+#endif
+        }
+
+        // Tenta fazer o Bind se aplicável
+        if ((mode == SWRAP_BIND) && (bind(sock, p->ai_addr, (socklen_t)p->ai_addrlen) != 0)) {
+            swrapClose(sock);
+            sock = -1;
+            continue; // Tenta o próximo nó
+        }
+
+        // Configuração de socket não-bloqueante
+        if (flags & SWRAP_NOBLOCK) {
+#ifdef _WIN32
             DWORD no_block = 1;
-            if (ioctlsocket(sock, FIONBIO, &no_block)) {
+            if (ioctlsocket(sock, FIONBIO, &no_block) != 0) {
                 swrapClose(sock);
-                return -1;
+                sock = -1;
+                continue;
             }
-        #else
-            if (fcntl(sock, F_SETFL, O_NONBLOCK, 1) == -1) {
+#else
+            int flags_old = fcntl(sock, F_GETFL, 0);
+            if (flags_old == -1 || fcntl(sock, F_SETFL, flags_old | O_NONBLOCK) == -1) {
                 swrapClose(sock);
-                return -1;
+                sock = -1;
+                continue;
             }
-        #endif
+#endif
+        }
+
+        // Tenta Conectar se aplicável (para modo bloqueante)
+        if ((mode == SWRAP_CONNECT) && (connect(sock, p->ai_addr, (socklen_t)p->ai_addrlen) != 0) && (!(flags & SWRAP_NOBLOCK))) {
+            swrapClose(sock);
+            sock = -1;
+            continue; // Tenta o próximo nó
+        }
+
+        // Se chegou até aqui com sucesso, encontramos o socket válido!
+        break;
     }
-    //connect if applicable (return only relevant if blocking)
-    if ((mode == SWRAP_CONNECT)&&(connect(sock, result->ai_addr, result->ai_addrlen))&&(!(flags&SWRAP_NOBLOCK))) {
-        swrapClose(sock);
-        return -1;
-    }
-    //free address info
+
     freeaddrinfo(result);
-    //return socket handle
-    return sock;
+    return sock; // Retorna o socket criado ou -1 se todos os nós falharam
 }
+
+
 SWDEF void swrapClose (int sock) {
     #ifdef _WIN32
         closesocket(sock);
@@ -260,9 +304,26 @@ SWDEF int swrapSend (int sock, const char* data, int data_size) {
 SWDEF int swrapReceive (int sock, char* data, int data_size) {
     return recv(sock, data, data_size, 0);
 }
-SWDEF int swrapSendTo (int sock, struct swrap_addr* addr, const char* data, int data_size) {
-    return sendto(sock, data, data_size, 0, (struct sockaddr*)addr, sizeof(struct swrap_addr));
+
+/* Beto Sep, 6 2026 */
+SWDEF int swrapSendTo(int sock, struct swrap_addr* addr, const char* data, int data_size) {
+    #ifdef _WIN32
+        int addr_len = sizeof(struct swrap_addr);
+    #else
+        socklen_t addr_len = sizeof(struct swrap_addr);
+    #endif
+
+    if (addr) {
+        struct sockaddr* sa = (struct sockaddr*)addr;
+        if (sa->sa_family == AF_INET) {
+            addr_len = sizeof(struct sockaddr_in);
+        } else if (sa->sa_family == AF_INET6) {
+            addr_len = sizeof(struct sockaddr_in6);
+        }
+    }
+    return sendto(sock, data, data_size, 0, (struct sockaddr*)addr, addr_len);
 }
+
 SWDEF int swrapReceiveFrom (int sock, struct swrap_addr* addr, char* data, int data_size) {
     #ifdef _WIN32
         int addr_size = sizeof(struct swrap_addr);
@@ -273,30 +334,65 @@ SWDEF int swrapReceiveFrom (int sock, struct swrap_addr* addr, char* data, int d
 }
 
 //select functions
-SWDEF int swrapSelect (int sock, double timeout) {
-    fd_set set; struct timeval time;
-    //fd set
+SWDEF int swrapSelect(int sock, double timeout) {
+    fd_set set; 
+    struct timeval time;
+    struct timeval* ptime = NULL;
+
     FD_ZERO(&set);
     if (sock > -1) FD_SET(sock, &set);
-    //timeout
-    time.tv_sec = timeout;
-    time.tv_usec = (timeout - time.tv_sec)*1000000.0;
-    //return
-    return select(sock+1, &set, NULL, NULL, &time);
+
+    if (timeout >= 0.0) {
+        time.tv_sec = (long)timeout;
+        time.tv_usec = (long)((timeout - (double)time.tv_sec) * 1000000.0);
+        ptime = &time;
+    }
+
+    return select(sock + 1, &set, NULL, NULL, ptime);
 }
-SWDEF int swrapMultiSelect (int* socks, int socks_size, double timeout) {
-    fd_set set; struct timeval time; int sock_max = -1;
-    //fd set
+
+
+/*Beto sep, 6 2026*/
+SWDEF int swrapMultiSelect(int* socks, int socks_size, double timeout) {
+    fd_set set; 
+    struct timeval time;
+    struct timeval* ptime = NULL;
+    int sock_max = -1;
+    int valid_count = 0;
+    
     FD_ZERO(&set);
     for (int i = 0; i < socks_size; i++) {
-        if (socks[i] > sock_max) sock_max = socks[i];
-        if (socks[i] > -1) FD_SET(socks[i], &set);
+        if (socks[i] > -1) {
+            if (socks[i] > sock_max) sock_max = socks[i];
+            FD_SET(socks[i], &set);
+            valid_count++;
+        }
     }
-    //timeout
-    time.tv_sec = timeout;
-    time.tv_usec = (timeout - time.tv_sec)*1000000.0;
-    //return
-    return select(sock_max+1, &set, NULL, NULL, &time);
+    
+    if (timeout >= 0.0) {
+        time.tv_sec = (long)timeout;
+        time.tv_usec = (long)((timeout - (double)time.tv_sec) * 1000000.0);
+        ptime = &time;
+    }
+    
+    // Se a lista do Lua vier vazia ou só com sockets fechados, dorme e retorna.
+    if (valid_count == 0) {
+        select(0, NULL, NULL, NULL, ptime);
+        return -1; 
+    }
+    
+    int ret = select(sock_max + 1, &set, NULL, NULL, ptime);
+    
+    if (ret <= 0) return ret; // 0 = Timeout, -1 = Erro
+    
+    // A sua lógica: Retorna o primeiro socket pronto encontrado
+    for (int i = 0; i < socks_size; i++) {
+        if (socks[i] > -1 && FD_ISSET(socks[i], &set)) {
+            return socks[i]; 
+        }
+    }
+    
+    return -1; 
 }
 
 #endif //SWRAP_IMPLEMENTATION

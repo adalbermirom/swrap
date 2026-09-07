@@ -51,7 +51,8 @@ struct swrap_addr {
 };
 
 //function declarations
-
+SWDEF int swrapGetType(int sock);
+    // Returns SWRAP_TCP (0), SWRAP_UDP (1), or -1 if sock is not a valid socket handle.
 SWDEF void swrapGetLastSocketError(char* buf, size_t buf_size);
     //Returns the last error in a formated string.
 SWDEF int swrapInit();
@@ -130,6 +131,30 @@ SWDEF int swrapMultiSelect(int*, int, double);
 #include <stddef.h> //NULL
 #include <errno.h>
 
+#include <string.h> //strerror_r 
+
+
+SWDEF int swrapGetType(int sock) {
+    if (sock < 0) return -1;
+
+    int type = 0;
+#ifdef _WIN32
+    int len = sizeof(type);
+    if (getsockopt(sock, SOL_SOCKET, SO_TYPE, (char*)&type, &len) == SOCKET_ERROR) {
+        return -1;
+    }
+#else
+    socklen_t len = sizeof(type);
+    if (getsockopt(sock, SOL_SOCKET, SO_TYPE, &type, &len) == -1) {
+        return -1;
+    }
+#endif
+
+    if (type == SOCK_STREAM) return SWRAP_TCP;
+    if (type == SOCK_DGRAM)  return SWRAP_UDP;
+
+    return -1;
+}
 
 
 void swrapGetLastSocketError(char* buf, size_t buf_size) {

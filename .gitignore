@@ -1,0 +1,34 @@
+# Executáveis da pasta de exemplos
+examples/ztest1
+examples/zmultiselect_test
+examples/zudp_test
+ztest1
+zmultiselect_test
+zudp_test
+
+# Executáveis no Windows
+*.exe
+*.out
+*.app
+
+# Arquivos de compilação e bibliotecas
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+
+# Arquivos de log, temporários e saídas de teste
+*.log
+log.txt
+*.tmp
+*.swp
+*~
+
+# Pastas e arquivos de IDEs / Editores
+.vscode/
+.idea/
+*.user
+*.suo
+.DS_Store
